@@ -1,0 +1,12 @@
+# Reference environment that produced 89.08%:
+#   python  3.12.16
+#   torch   2.12.0a0+rocm7.13.0a20260313
+#   torchvision 0.26.0a0+rocm7.13.0a20260313
+#   AMD Radeon 780M (gfx1103), HIP 7.2.0
+#
+# The exact ROCm nightly above is NOT required -- it is just what this machine
+# had.  Any reasonably recent PyTorch + torchvision works, and the model is
+# small enough to train on CPU.
+torch>=2.0
+torchvision>=0.15
+numpy

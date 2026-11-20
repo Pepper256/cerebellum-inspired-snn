@@ -1,0 +1,10 @@
+# MNIST is downloaded here on first run (torchvision).
+data/
+
+# Training output.  `checkpoint/` is deliberately NOT ignored: it ships the
+# weights that reproduce the reported 89.08%.
+runs/
+
+__pycache__/
+*.pyc
+*.log
