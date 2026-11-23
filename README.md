@@ -2,7 +2,12 @@
 
 A spiking network modelled on the cerebellar cortex, trained on MNIST with **local learning rules only — no backpropagation and no autograd**.
 
-**Test accuracy 89.08%** · 73,728 synapses · 73,738 plastic weights · T = 25 time steps
+**Test accuracy 94.07 % (T = 100) · 89.08 % (T = 25)** · 73,728 synapses · 73,738 plastic weights · no backpropagation
+
+> Both checkpoints ship in [`checkpoint/`](checkpoint). The two numbers are two
+> **operating points of the same architecture** (same 73,728 synapses, same
+> parameters — only the number of simulated time steps differs), **not** two
+> architectures. See §3.6 before quoting either one.
 
 ---
 
@@ -59,7 +64,7 @@ I_c     = (1/T) Σ_t ( mean_{i∈PC(c)} s_i[t] )²
 
 | 项 | 值 |
 |---|---|
-| 时间步 T | 25 |
+| 时间步 T | 25（另附 T=100 的检查点，参数完全相同，见 §3.6） |
 | `nn.Parameter` 数量 | 40,971 |
 | 被局部规则修改的权重 | **73,738**（PF→PC 40,960 + MF→GrC 32,768 + DCN 偏置 10） |
 | 前向是否用 autograd | **否** |
@@ -159,7 +164,16 @@ for epoch in 1..30:
 | `epochs` | 30 | | `gate_kappa` / `gate_scale` | 1.0 / 0.02 |
 | `batch_size` | 128 | | `seed` | 0 |
 
-### 2.7 复现
+### 2.7 检查点
+
+| 文件 | T | test acc | best val | 训练 |
+|---|---|---|---|---|
+| `checkpoint/best.pt` | 25 | 89.08% | 88.12%（epoch 28） | 30 epoch |
+| `checkpoint/best_T100.pt` | 100 | **94.07%** | 94.08%（epoch 47） | 50 epoch |
+
+两者是**同一个架构的两个工作点**，参数量与突触数逐位相同。
+
+### 2.8 复现
 
 ```bash
 pip install -r requirements.txt
@@ -168,8 +182,14 @@ pip install -r requirements.txt
 python eval.py --ckpt checkpoint/best.pt
 # -> accuracy : 89.08%
 
+python eval.py --ckpt checkpoint/best_T100.pt
+# -> accuracy : 94.07%     (注意：该检查点必须在 T=100 下评估，见 §3.6)
+
 # 从零训练（约 17 分钟 GPU / 更久 CPU）
 python train.py --epochs 30 --goc-homeo --grc-learn hebb --eta-g 0.1 --goc-gate
+
+# 训练 T=100 的检查点（约 46 分钟 GPU）
+python train.py --T 100 --epochs 50 --goc-homeo --grc-learn hebb --eta-g 0.1 --goc-gate
 
 # 七项不变量自检（不需要训练数据）
 python model.py
@@ -182,6 +202,8 @@ python model.py
 ## 3. Benchmark 报告数据
 
 ### 3.1 主结果
+
+> 本节是 `checkpoint/best.pt`（**T = 25**）的完整记录。T = 100 的检查点见 **§3.6**。
 
 | 指标 | 值 |
 |---|---|
@@ -246,6 +268,49 @@ python model.py
 
 > per-group 增益相对全局标量的增益为 **+0.58 pt（≈1.9 倍标准误）**，处于边缘；门控机制额外贡献的 **+0.06 pt** 落在噪声内。
 
----
+### 3.6 第二个工作点：T = 100
+
+`checkpoint/best_T100.pt`，训练命令只改两个参数（`--T 100 --epochs 50`），其余超参逐位不变。
+
+| 指标 | T=25 检查点 | **T=100 检查点** |
+|---|---|---|
+| **MNIST test** | 89.08% | **94.07%** |
+| best validation | 88.12%（epoch 28） | 94.08%（epoch 47） |
+| 训练轮数 | 30 | 50 |
+| 训练墙钟（780M iGPU） | 997.8 s | 2748 s |
+| 训练后 GrC 活动率 | 5.13% | 5.07% |
+| 训练后 PC 发放率 | 10.56% | 10.30% |
+| 参数量 / 突触 | 40,971 / 73,728 | **同（不变）** |
+
+#### 这 5 pt 主要来自**评估窗口**，不是训练得更久
+
+模型是**无状态**的（`u`、`c`、`a_lp` 每次通过都从 0 开始，动力学不读 `T`），所以同一份权重可以在任意步数上仿真：
+
+| 权重 ＼ 评估 T | 25 | 50 | 100 |
+|---|---|---|---|
+| T=25 检查点 | 89.08% | 92.46% | 92.50% |
+| **T=100 检查点** | **68.71%** | 90.30% | **94.07%** |
+
+- 同一份 **T=25 权重**只要把窗口拉到 100 步就有 **92.50%**（完全不动权重）。
+  原因：`I_c` 是 PC 发放率的**时间均值**，窗口越短估计误差越大（误差按 `1/√T` 下降）。
+- 反过来，**T=100 训出的权重在 T=25 上只有 68.71%** —— 它被标定到了长窗口的工作点。
+- **所以引用任一数字都必须带上它的 T。** 89.08% 与 94.07% 不是"改进"，是两个工作点。
+
+#### 代价（同一台机器，PyTorch eager，只推理，不含训练）
+
+| | T=25 | T=100 | 同突触模拟孪生体 | 784-512-512-10 ANN |
+|---|---|---|---|---|
+| 每样本事件（event-MAC） | 49,844 | 194,307 | 73,728 MAC | 668,672 MAC |
+| ms / 512 样本（GPU） | 75.4 | 295.4 | 9.9 | 2.0 |
+| ms / 512 样本（CPU，16 核） | 267.9 | 1003.3 | 29.3 | 67.6 |
+| 单样本延迟（GPU） | 15.3 ms | 45.6 ms | 0.5 ms | 0.4 ms |
+| 峰值显存（batch 512） | 174.1 MB | **174.1 MB** | 166.7 MB | 43.2 MB |
+| 权重体积 | 0.57 MB | 0.57 MB | 0.57 MB | 2.68 MB |
+
+- **显存不随 T 变**（不按步存中间量）：T=100 的代价是纯延迟/算力，不是空间。
+- **T=100 的事件数是同突触模拟孪生体的 2.64×**，盈亏平衡点 `T* ≈ 38`。
+  所以 **T=100 不能拿"事件稀疏省算力"来论证能效**；只有 T=25（0.68×）可以。
+- SNN 对 ANN 的墙钟劣势在 CPU 上从 147× 收窄到 15×：GPU 加速的是可并行的宽算子，
+  而这 100 个顺序小 kernel 填不满 GPU。设备相关的结论不宜外推到神经形态硬件。
 
 MIT License — see [LICENSE](LICENSE).

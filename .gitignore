@@ -2,7 +2,8 @@
 data/
 
 # Training output.  `checkpoint/` is deliberately NOT ignored: it ships the
-# weights that reproduce the reported 89.08%.
+# weights that reproduce the reported numbers -- best.pt (T=25, 89.08%) and
+# best_T100.pt (T=100, 94.07%).
 runs/
 
 __pycache__/
