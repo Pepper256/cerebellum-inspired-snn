@@ -18,7 +18,7 @@ Examples
     python train.py --epochs 30 --groups g0            # ablation b: LTD only
     python train.py --epochs 30 --goc-target 1.0       # ablation c: GoC off
     python train.py --epochs 30 --mfd-dcn none         # ablation d: no MF->DCN bias
-    python train.py --epochs 30 --n-mli 20             # v4: + MLI feed-forward shunt
+    python train.py --epochs 30
 """
 
 from __future__ import annotations
@@ -46,24 +46,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--n-goc-groups", type=int, default=16)
     p.add_argument("--n-group", type=int, default=1)
     p.add_argument("--n-pc-per-class", type=int, default=1)
-    # ---- v4: molecular layer interneurons (feed-forward shunt onto PC) ----
-    p.add_argument("--n-mli", type=int, default=0,
-                   help="number of molecular layer interneurons (0 = off, v3 "
-                        "behaviour). They read the SAME GrC spikes as the PC and "
-                        "MULTIPLICATIVELY shunt its drive")
-    p.add_argument("--mli-fan-in", type=int, default=16,
-                   help="GrC each MLI samples")
-    p.add_argument("--mli-pc-fan-in", type=int, default=8,
-                   help="MLIs each PC listens to (its sagittal zone)")
-    p.add_argument("--mli-in-gain", type=float, default=4.0,
-                   help="excitatory gain GrC->MLI; tune so MLI rate lands near the "
-                        "PC rate.  MLI input is the MEAN of its fan-in GrC spikes "
-                        "(row sum 1), i.e. roughly the GrC population rate")
-    p.add_argument("--mli-gain", type=float, default=3.0,
-                   help="shunt depth: fraction of PC drive removed when the whole "
-                        "MLI pool fires (clamped to 0.95)")
-    p.add_argument("--mli-beta", type=float, default=0.9)
-    p.add_argument("--mli-thresh", type=float, default=1.0)
     p.add_argument("--T", type=int, default=25)
     p.add_argument("--beta", type=float, default=0.9)
     p.add_argument("--thresh", type=float, default=1.0)
@@ -124,9 +106,6 @@ def make_model(a: argparse.Namespace) -> CerebellarSNN:
     return CerebellarSNN(
         n_grc=a.n_grc, grc_fan_in=a.grc_fan_in, n_goc_groups=a.n_goc_groups,
         n_group=a.n_group, n_pc_per_class=a.n_pc_per_class,
-        n_mli=a.n_mli, mli_fan_in=a.mli_fan_in, mli_pc_fan_in=a.mli_pc_fan_in,
-        mli_in_gain=a.mli_in_gain, mli_gain=a.mli_gain,
-        mli_beta=a.mli_beta, mli_thresh=a.mli_thresh,
         T=a.T, beta=a.beta, thresh=a.thresh, reset=a.reset, encoder=a.encoder,
         grc_gain=a.grc_gain, pc_gain=a.pc_gain,
         goc_gain=a.goc_gain, goc_tau=a.goc_tau,
@@ -158,7 +137,6 @@ def evaluate(model, loader, device) -> dict[str, float]:
     model.eval()
     correct = total = 0
     grc = 0.0
-    mli = 0.0
     pc = [0.0] * model.n_group
     for x, y in loader:
         x, y = x.to(device), y.to(device)
@@ -166,13 +144,10 @@ def evaluate(model, loader, device) -> dict[str, float]:
         correct += (logits.argmax(1) == y).sum().item()
         total += y.numel()
         grc += st["grc_rate"] * y.numel()
-        if model.n_mli:
-            mli += st["mli_rate"] * y.numel()
         for e in range(model.n_group):
             pc[e] += st["pc_rate_per_group"][e] * y.numel()
     return {"acc": correct / max(total, 1),
             "grc_rate": grc / max(total, 1),
-            "mli_rate": mli / max(total, 1),
             "pc_rates": [v / max(total, 1) for v in pc]}
 
 
@@ -208,9 +183,6 @@ def main() -> int:
         print(f"  pooled I per group: "
               + "  ".join(f"{v:.4f}" for v in st["I_mean_per_group"]))
         print(f"  GoC inhibition mean {st['goc_inh_mean']:.4f} max {st['goc_inh_max']:.4f}")
-        if args.n_mli:
-            print(f"  MLI rate {st['mli_rate']:.4f}  shunt mean "
-                  f"{st['mli_shunt_mean']:.3f}  per-PC max {st['mli_inh_max']:.3f}")
         print(f"  logits std {logits.std():.4f} range "
               f"[{logits.min():+.3f}, {logits.max():+.3f}]")
         with torch.no_grad():
@@ -231,14 +203,13 @@ def main() -> int:
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(["epoch", "train_loss", "train_acc", "val_acc", "grc_rate",
-                         "mli_rate", "pc_rate_g0", "pc_rate_g1", "n_wrong", "elapsed_s"])
+                         "pc_rate_g0", "pc_rate_g1", "n_wrong", "elapsed_s"])
         for epoch in range(1, args.epochs + 1):
             model.train()
             correct = total = wrong = 0
             gdiag_acc = {"grc_dW": 0.0, "grc_row_max_mean": float("nan"),
                          "grc_rows_updated": 0, "grc_gate_mean": 0.0}
             grc_sum = 0.0
-            mli_sum = 0.0
             for i, (x, y) in enumerate(loaders["train"]):
                 if args.max_batches and i >= args.max_batches:
                     break
@@ -257,8 +228,6 @@ def main() -> int:
                 wrong += diag["n_wrong"]
                 gdiag_acc = gdiag
                 grc_sum += st["grc_rate"] * y.numel()
-                if args.n_mli:
-                    mli_sum += st["mli_rate"] * y.numel()
 
             tr_acc = correct / max(total, 1)
             val = evaluate(model, loaders["val"], device) if loaders["val"] else {"acc": float("nan")}
@@ -266,7 +235,6 @@ def main() -> int:
             elapsed = time.time() - t0
             writer.writerow([epoch, "", f"{tr_acc:.4f}", f"{val_acc:.4f}",
                              f"{grc_sum / max(total, 1):.4f}",
-                             f"{mli_sum / max(total, 1):.4f}" if args.n_mli else "",
                              f"{val.get('pc_rates', [float('nan')])[0]:.4f}",
                              f"{val.get('pc_rates', [float('nan'), float('nan')])[1]:.4f}"
                              if model.n_group > 1 else "",
@@ -274,7 +242,6 @@ def main() -> int:
             fh.flush()
             print(f"epoch {epoch:2d}/{args.epochs}  train {tr_acc * 100:.2f}%  "
                   f"val {val_acc * 100:.2f}%  grc {grc_sum / max(total, 1):.3f}  "
-                  + (f"mli {mli_sum / max(total, 1):.3f}  " if args.n_mli else "")
                   + f"wrong {wrong}/{total}"
                   + (f"  grc_dW {gdiag_acc['grc_dW']:.1e}  rowmax "
                      f"{gdiag_acc['grc_row_max_mean']:.3f}  upd "
@@ -299,7 +266,6 @@ def main() -> int:
         "best_val_acc": best_val,
         "test_acc": test["acc"],
         "grc_rate": test["grc_rate"],
-        "mli_rate": test["mli_rate"],
         "pc_rates": test["pc_rates"],
         "synapses": float(model.n_synapses()),
         "trainable": float(model.n_trainable()),
@@ -313,8 +279,6 @@ def main() -> int:
     print(f"accuracy        : {test['acc'] * 100:.2f}%  "
           f"(best val {best_val * 100:.2f}% @ epoch {best_epoch})")
     print(f"GrC rate        : {test['grc_rate']:.4f}")
-    if args.n_mli:
-        print(f"MLI rate        : {test['mli_rate']:.4f}")
     print(f"PC rates/group  : " + "  ".join(f"{v:.4f}" for v in test["pc_rates"]))
     print(f"outputs         : {out_dir / 'best.pt'}, {csv_path}, {out_dir / 'summary.json'}")
     return 0

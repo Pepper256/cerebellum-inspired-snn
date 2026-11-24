@@ -191,7 +191,7 @@ python train.py --epochs 30 --goc-homeo --grc-learn hebb --eta-g 0.1 --goc-gate
 # 训练 T=100 的检查点（约 46 分钟 GPU）
 python train.py --T 100 --epochs 50 --goc-homeo --grc-learn hebb --eta-g 0.1 --goc-gate
 
-# 七项不变量自检（不需要训练数据）
+# 六项不变量自检（不需要训练数据）
 python model.py
 ```
 

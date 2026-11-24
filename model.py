@@ -9,11 +9,15 @@ The biological circuit (Marr-Albus-Ito, plus the modern microzone view):
                        ->  Golgi cells (GoC) -> GrC     [local feedback inhibition]
     GrC/parallel fibres -> Purkinje cells (PC)           [massive fan-in, the only
                                                          plastic synapse]
-                       ->  molecular layer interneurons (MLI) -> PC
-                                                         [FEED-FORWARD inhibition]
     climbing fibre (CF)  -> PC                          [teaching signal]
     PC -> deep cerebellar nuclei (DCN)                  [inhibitory output]
     MF collaterals -> DCN                               [excitatory drive]
+
+Molecular layer interneurons (MLI) were implemented and removed: under this
+architecture they are provably a no-op.  The readout takes an argmax over
+`b_c - gamma * I_c` with the SAME gamma for every class, so a common-mode shift
+added to all PC rates adds the same constant to all ten logits and changes no
+decision.  They cost synapses and bought nothing, so the code is gone.
 
 Two facts drive the design:
 
@@ -33,40 +37,6 @@ Two facts drive the design:
     Both groups see the SAME GrC output -- this is a "pseudo mixture of experts":
     no gating, no routing, all inputs to all groups.  Diversity comes from the
     teaching signal, not from the inputs.
-
-Molecular layer interneurons (MLI), v4
---------------------------------------
-The second cerebellar interneuron class, omitted until now.  The parallel fibres
-that excite a PC also excite MLIs, and MLIs inhibit PCs: textbook *feed-forward*
-inhibition, i.e. the opposite geometry to the GoC (which is feedback onto GrC).
-
-Why multiplicative, not subtractive
-    In the published conductance-based cerebellar PC model (Mitsuhashi et al.,
-    Neural Networks 193:107962, 2026; table 2) the PC's GABA-A reversal is
-    E_inh = -70 mV against a resting E_leak = -68 mV.  Opening g_inh = 0.70 nS on
-    top of g_leak = 2.32 nS therefore moves the effective reversal to only
-    -68.46 mV (a 0.46 mV hyperpolarisation) while cutting the input resistance to
-    2.32/3.02 = 77%.  The MLI is a SHUNT: it divides the PC's response to
-    parallel-fibre drive rather than subtracting a fixed current.  So here
-
-        drive <- drive * (1 - clamp(mli_gain * inh, 0, 0.95))
-
-    and NOT `drive - mli_gain * inh`.  `inh` in [0, 1] is the fraction of that
-    PC's own MLI pool that spiked on this step.
-
-Why it might matter for accuracy
-    Our PCs receive only excitation plus a per-PC slow homeostatic gain (pc_h).
-    Neither can express "this PC should be quiet *because the whole population is
-    loud*".  Digits have very different ink mass, so the GrC code gets globally
-    louder on some samples and every PC's drive rises together; the readout then
-    sees a common-mode shift.  MLI is the circuit that removes it (the review we
-    take the anatomy from calls the MLI drive "stable feed-forward inhibition"
-    that holds PC output in place -- Nat Rev Neurosci 26:538, 2025).
-
-Fixed, never learned
-    PF->PC is the plastic site; MLI->PC is not.  All MLI weights are frozen
-    buffers (non-persistent: they are a deterministic function of `seed`, so they
-    never enter a checkpoint and old checkpoints keep loading unchanged).
 
 Readout
 -------
@@ -111,7 +81,7 @@ def build_grc_index(n_in: int, n_grc: int, fan_in: int, seed: int = 0) -> torch.
 
 
 class CerebellarSNN(nn.Module):
-    """784 -> GrC(fixed random, GoC-sparsified) -> [MLI shunt] -> {n_group x 10 x G PCs} -> DCN."""
+    """784 -> GrC(fixed random, GoC-sparsified) -> {n_group x 10 x G PCs} -> DCN."""
 
 
     def __init__(
@@ -124,14 +94,6 @@ class CerebellarSNN(nn.Module):
         n_goc_groups: int = 16,
         n_group: int = 1,
         n_pc_per_class: int = 1,
-        # ---- v4: molecular layer interneurons (0 = disabled, exact v3 behaviour)
-        n_mli: int = 0,
-        mli_fan_in: int = 16,
-        mli_pc_fan_in: int = 8,
-        mli_in_gain: float = 4.0,
-        mli_gain: float = 3.0,
-        mli_beta: float = 0.9,
-        mli_thresh: float = 1.0,
         T: int = 25,
         beta: float = 0.9,
         thresh: float = 1.0,
@@ -157,12 +119,6 @@ class CerebellarSNN(nn.Module):
             raise ValueError("readout must be 'quadratic' or 'linear'")
         if mfd_dcn not in ("tonic", "none", "full"):
             raise ValueError("mfd_dcn must be 'tonic', 'none' or 'full'")
-        if n_mli < 0:
-            raise ValueError("n_mli must be >= 0")
-        if n_mli and mli_pc_fan_in > n_mli:
-            raise ValueError(f"mli_pc_fan_in={mli_pc_fan_in} exceeds n_mli={n_mli}")
-        if n_mli and mli_fan_in > n_grc:
-            raise ValueError(f"mli_fan_in={mli_fan_in} exceeds n_grc={n_grc}")
 
         self.n_in, self.img, self.n_class = n_in, img, n_class
         self.n_grc, self.grc_fan_in = n_grc, grc_fan_in
@@ -170,11 +126,6 @@ class CerebellarSNN(nn.Module):
         self.goc_size = n_grc // n_goc_groups
         self.n_group, self.G = n_group, n_pc_per_class
         self.n_pc = n_group * n_class * n_pc_per_class
-        self.n_mli = n_mli
-        self.mli_fan_in, self.mli_pc_fan_in = mli_fan_in, mli_pc_fan_in
-        self.mli_in_gain, self.mli_gain = mli_in_gain, mli_gain
-        self.mli_beta, self.mli_thresh = mli_beta, mli_thresh
-        self.mli_clamp = 0.95        # never shut a PC drive fully off
         self.T, self.beta, self.thresh = T, beta, thresh
         self.reset, self.encoder = reset, encoder
         self.grc_gain, self.pc_gain = grc_gain, pc_gain
@@ -199,30 +150,6 @@ class CerebellarSNN(nn.Module):
         w = torch.rand(n_grc, grc_fan_in, generator=torch.Generator().manual_seed(seed + 1))
         w = w / w.sum(dim=1, keepdim=True)
         self.register_buffer("grc_w", w, persistent=True)
-
-        # ---- GrC -> MLI -> PC : FEED-FORWARD inhibition, all fixed -----------------
-        # persistent=False on purpose: every one of these is a deterministic
-        # function of `seed`, so they never need to ride along in a checkpoint and
-        # enabling/disabling MLI cannot break loading an older checkpoint.
-        if n_mli:
-            self.register_buffer(
-                "mli_idx", build_grc_index(n_grc, n_mli, mli_fan_in, seed + 3),
-                persistent=False)
-            wm = torch.rand(n_mli, mli_fan_in,
-                            generator=torch.Generator().manual_seed(seed + 4))
-            self.register_buffer("mli_w", wm / wm.sum(dim=1, keepdim=True),
-                                 persistent=False)
-            # each PC listens to its OWN sparse subset of MLIs (a sagittal zone,
-            # not a whole-cortex broadcast), so different classes get different
-            # amounts of shunt -> the shunt carries information, not just gain.
-            g = torch.Generator().manual_seed(seed + 5)
-            mli_pc = torch.zeros(self.n_pc, n_mli)
-            for i in range(self.n_pc):
-                sel = torch.randperm(n_mli, generator=g)[:mli_pc_fan_in]
-                mli_pc[i, sel] = 1.0 / mli_pc_fan_in
-            self.register_buffer("mli_pc_w", mli_pc, persistent=False)
-        else:
-            self.mli_idx = self.mli_w = self.mli_pc_w = None
 
         # ---- GrC -> PC : the only plastic weights, one set per group -------------
         # rows are kept sum-normalised to 1, so a PC's drive is the GrC activity
@@ -293,12 +220,6 @@ class CerebellarSNN(nn.Module):
         # across batches would make eval depend on history.
         a_lp = torch.zeros(B, self.n_goc_groups, device=dev, dtype=dt)
         goc_last = torch.zeros_like(a_lp)
-        with_mli = bool(self.n_mli)
-        if with_mli:
-            u_m = torch.zeros(B, self.n_mli, device=dev, dtype=dt)
-            c_m = torch.zeros_like(u_m)
-            inh_max = torch.zeros((), device=dev, dtype=dt)
-            shunt_acc = torch.zeros((), device=dev, dtype=dt)
 
         for _ in range(self.T):
             goc_last = self.goc_g.view(1, -1) * a_lp
@@ -309,21 +230,6 @@ class CerebellarSNN(nn.Module):
             c_g = c_g + s_g
 
             drive = s_g @ self.w_pc.t()
-            if with_mli:
-                # PF -> MLI: the SAME GrC spikes that drive the PC also drive the
-                # MLI pool, one step earlier in circuit terms -- feed-forward.
-                a_m = (s_g[:, self.mli_idx] * self.mli_w).sum(dim=-1)
-                u_m = self.mli_beta * u_m + self.mli_in_gain * a_m
-                s_m = _heav(u_m, self.mli_thresh)
-                u_m = u_m - self.mli_thresh * s_m
-                c_m = c_m + s_m
-                # MLI -> PC: multiplicative shunt (see the module docstring).
-                # `inh` is the fraction of this PC's own MLI pool that fired.
-                inh = (s_m @ self.mli_pc_w.t()).clamp_(0.0, 1.0)
-                shunt = (self.mli_gain * inh).clamp_(0.0, self.mli_clamp)
-                drive = drive * (1.0 - shunt)
-                inh_max = torch.maximum(inh_max, inh.max())
-                shunt_acc = shunt_acc + shunt.mean()
             if self.pc_homeo:
                 drive = drive * self.pc_h
             u_p = self.beta * u_p + self.pc_gain * drive
@@ -364,12 +270,6 @@ class CerebellarSNN(nn.Module):
             "goc_inh_max": goc_last.max().item(),
             "pool_max": I.max().item(),
         }
-        if with_mli:
-            stats["mli_rate"] = (c_m.mean() / self.T).item()
-            stats["mli_rate_per_neuron"] = c_m.mean(dim=0) / self.T   # (n_mli,)
-            stats["mli_inh_max"] = inh_max.item()
-            # mean fraction of PC drive removed by the MLI shunt over the pass
-            stats["mli_shunt_mean"] = (shunt_acc / self.T).item()
         return logits, stats
 
     @torch.no_grad()
@@ -400,12 +300,7 @@ class CerebellarSNN(nn.Module):
     # ----------------------------------------------------------------- counts ---
     def n_synapses(self) -> int:
         n = self.n_grc * self.grc_fan_in + self.n_pc * self.n_grc
-        if self.n_mli:
-            # GrC->MLI is one fan_in per MLI (NOT one per GrC), and MLI->PC is one
-            # fan_in per PC (each PC listens to only its own mli_pc_fan_in MLIs)
-            n += self.n_mli * self.mli_fan_in + self.n_pc * self.mli_pc_fan_in
         return n
-
     def n_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
@@ -424,15 +319,12 @@ class CerebellarSNN(nn.Module):
         return n
 
     def extra_repr(self) -> str:
-        mli = (f" | MLI {self.n_mli} (fan-in {self.mli_fan_in}, shunt gain "
-               f"{self.mli_gain}, {self.mli_pc_fan_in}/PC, in-gain "
-               f"{self.mli_in_gain})" if self.n_mli else " | MLI off")
         return (f"784 -> GrC {self.n_grc} (fan-in {self.grc_fan_in}, GoC "
                 f"{self.n_goc_groups}x{self.goc_size} lp(gain {self.goc_gain}, "
                 f"tau {self.goc_tau}))"
                 f" -> {self.n_group} groups x {self.n_class} x {self.G} PC "
                 f"= {self.n_pc} -> DCN, T={self.T}, readout={self.readout}, "
-                f"mfd_dcn={self.mfd_dcn}" + mli)
+                f"mfd_dcn={self.mfd_dcn}")
 
 
 # -------------------------------------------------------------------- self-check ---
@@ -526,22 +418,6 @@ def _selfcheck() -> None:
         print(f"  <dw[true], z>      = {ov_y:+.3e}   (expect < 0: move away, LTD)")
         print(f"  <dw[predicted], z> = {ov_d:+.3e}   (expect > 0: move toward, LTP)")
         print(f"  {'OK' if ov_y < 0 < ov_d else '!! SIGN ERROR'}")
-
-    # ---- check 7: MLI must shunt the PC drive and must NOT touch the encoder ----
-    print("\n=== [7] MLI (PF->MLI->PC feed-forward shunt, v4) ===")
-    net3 = CerebellarSNN(n_mli=20).to(dev).eval()
-    with torch.no_grad():
-        lg3, st3 = net3(x, return_stats=True)
-    same_grc = torch.equal(st3["grc_counts"], st["grc_counts"])
-    dlog = (lg3 - logits).abs().mean().item()
-    print(f"  MLI rate {st3['mli_rate']:.4f}  shunt mean {st3['mli_shunt_mean']:.3f}"
-          f"  per-PC max {st3['mli_inh_max']:.3f}")
-    print(f"  GrC counts identical to the no-MLI run : {same_grc}   "
-          f"(MLI must not alter the encoder)")
-    print(f"  mean |dlogit| vs the no-MLI model      : {dlog:.4f}   "
-          f"(0 => the shunt is dead)")
-    ok7 = same_grc and st3["mli_rate"] > 1e-4 and 0.02 < st3["mli_shunt_mean"] < 0.9
-    print(f"  {'OK' if ok7 else '!! MLI is dead, saturated, or leaking into GrC'}")
 
 
 if __name__ == "__main__":

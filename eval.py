@@ -31,10 +31,7 @@ def build(a: dict) -> CerebellarSNN:
              encoder="direct", grc_gain=1.0, pc_gain=5.0, goc_gain=2.0,
              goc_tau=2.0, gamma=3.0, readout="quadratic", mfd_dcn="tonic",
              pc_homeo=True, seed=0,
-             # v4 (MLI). Absent from old checkpoints -> defaults to 0 = v3, so
-             # every frozen baseline still rebuilds bit-identically.
-             n_mli=0, mli_fan_in=16, mli_pc_fan_in=8, mli_in_gain=4.0,
-             mli_gain=3.0, mli_beta=0.9, mli_thresh=1.0)
+             )
     d.update({k: v for k, v in a.items() if k in d})
     return CerebellarSNN(**d)
 
@@ -43,7 +40,6 @@ def build(a: dict) -> CerebellarSNN:
 def run(model, loader, device) -> dict:
     correct = total = 0
     grc = 0.0
-    mli = 0.0
     pc = [0.0] * model.n_group
     for x, y in loader:
         x, y = x.to(device), y.to(device)
@@ -51,13 +47,10 @@ def run(model, loader, device) -> dict:
         correct += (logits.argmax(1) == y).sum().item()
         total += y.numel()
         grc += st["grc_rate"] * y.numel()
-        if model.n_mli:
-            mli += st["mli_rate"] * y.numel()
         for e in range(model.n_group):
             pc[e] += st["pc_rate_per_group"][e] * y.numel()
     return {"acc": correct / max(total, 1), "n": total,
             "grc_rate": grc / max(total, 1),
-            "mli_rate": mli / max(total, 1),
             "pc_rates": [v / max(total, 1) for v in pc]}
 
 
@@ -96,8 +89,6 @@ def main() -> int:
     print(f"split      : {a.split}  n={res['n']}")
     print(f"accuracy   : {res['acc'] * 100:.2f}%")
     print(f"GrC rate   : {res['grc_rate']:.4f}")
-    if model.n_mli:
-        print(f"MLI rate   : {res['mli_rate']:.4f}")
     print(f"PC rates   : " + "  ".join(f"g{i}={v:.4f}" for i, v in enumerate(res["pc_rates"])))
     return 0
 
